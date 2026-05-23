@@ -14,6 +14,9 @@ use std::sync::Arc;
 
 use snowy_tunnel::SnowyStream;
 
+use crate::session::frame::{read_frame, write_frame, Frame};
+use crate::session::lifecycle::{CloseReason, SessionEvent};
+use crate::session::negotiate::{negotiate_client, Capabilities, FallbackTracker, CAP_REUSE};
 use crate::trojan::{
     self, Cmd, TrojanLikeRequest, TrojanUdpDatagramReceiver, TrojanUdpDatagramSender,
     MAX_DATAGRAM_SIZE,
@@ -21,13 +24,16 @@ use crate::trojan::{
 use crate::utils::{extract_host_addr_from_url, url_to_relative, vec_uninit, DurationExt};
 
 use super::connector::Connector;
+use super::pool::{PooledSession, SessionPool};
 use super::{FIRST_PACKET_TIMEOUT, MAX_FIRST_PACKET_SIZE};
 
 pub async fn serve(
     listen_addr: SocketAddr,
-    connector: impl Connector + 'static + Send + Sync,
+    connector: Arc<impl Connector + 'static + Send + Sync>,
+    pool: Option<Arc<SessionPool>>,
+    endpoint: String,
 ) -> Result<()> {
-    let connector = Arc::new(connector);
+    let fallback_tracker = Arc::new(FallbackTracker::new());
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("failed to bind on {}", listen_addr))?;
@@ -36,9 +42,21 @@ pub async fn serve(
         // TODO: handle error
         debug!("accepting connection from {}", &client_addr);
         let connector = connector.clone();
+        let pool = pool.clone();
+        let endpoint = endpoint.clone();
+        let fallback_tracker = fallback_tracker.clone();
         // convention: handle_connection only returns error in early/handshake phases
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(inbound, client_addr, connector).await {
+            if let Err(e) = handle_connection(
+                inbound,
+                client_addr,
+                connector,
+                pool,
+                endpoint,
+                fallback_tracker,
+            )
+            .await
+            {
                 warn!(error = %format!("{:#}", e), "failed to serve {}", &client_addr)
             }
         });
@@ -51,17 +69,40 @@ async fn handle_connection(
     inbound: TcpStream,
     client_addr: SocketAddr,
     connector: Arc<impl Connector + 'static>,
+    pool: Option<Arc<SessionPool>>,
+    endpoint: String,
+    fallback_tracker: Arc<FallbackTracker>,
 ) -> Result<()> {
     let mut first = [0u8];
     inbound.peek(&mut first).await?;
 
     match first[0] {
-        0x04 | 0x05 => handle_connection_socks5(inbound, client_addr, connector).await,
-        _ => handle_connection_http(inbound, client_addr, connector).await,
+        0x04 | 0x05 => {
+            handle_connection_socks5(
+                inbound,
+                client_addr,
+                connector,
+                pool,
+                endpoint,
+                fallback_tracker,
+            )
+            .await
+        }
+        _ => {
+            handle_connection_http(
+                inbound,
+                client_addr,
+                connector,
+                pool,
+                endpoint,
+                fallback_tracker,
+            )
+            .await
+        }
     }
 }
 
-#[instrument(name = "socks5_proxy", skip(inbound, client_addr, connector), fields(
+#[instrument(name = "socks5_proxy", skip(inbound, client_addr, connector, pool, fallback_tracker), fields(
     %client = client_addr,
     // %local_in = inbound.local_addr().unwrap(),
 ))]
@@ -70,6 +111,9 @@ async fn handle_connection_socks5(
     mut inbound: TcpStream,
     client_addr: SocketAddr,
     connector: Arc<impl Connector + 'static>,
+    pool: Option<Arc<SessionPool>>,
+    endpoint: String,
+    fallback_tracker: Arc<FallbackTracker>,
 ) -> Result<()> {
     const SOCKS5_CONNECT_SUCCEEDED: &[u8] =
         &[0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -94,12 +138,15 @@ async fn handle_connection_socks5(
                 .await
                 .context("failed to write socks5 response")?;
             // TODO: return error from connect?
-            let mut snowys = connector
-                .connect()
-                .await
-                .context("failed to establish snowy tunnel")?;
             let outbuf = Some(TrojanLikeRequest::new(Cmd::Connect, req.address).encoded());
-            log_relay!(relay_tcp_with(&mut inbound, &mut snowys, outbuf));
+            log_relay!(relay_tcp_remote(
+                &mut inbound,
+                connector,
+                pool,
+                endpoint,
+                fallback_tracker,
+                outbuf
+            ));
             Ok(())
         }
         socks5::Command::UdpAssociate => {
@@ -142,7 +189,7 @@ async fn handle_connection_socks5(
     }
 }
 
-#[instrument(name = "http_proxy", skip(inbound, client_addr, connector), fields(
+#[instrument(name = "http_proxy", skip(inbound, client_addr, connector, pool, fallback_tracker), fields(
     %client = client_addr,
     // %local_in = inbound.local_addr().unwrap(),
 ))]
@@ -151,6 +198,9 @@ async fn handle_connection_http(
     mut inbound: TcpStream,
     client_addr: SocketAddr,
     connector: Arc<impl Connector + 'static>,
+    pool: Option<Arc<SessionPool>>,
+    endpoint: String,
+    fallback_tracker: Arc<FallbackTracker>,
 ) -> Result<()> {
     const HTTP_200_CONNECTION_ESTABLISHED: &[u8] =
         b"HTTP/1.1 200 Connection Established\r\nX-Powered-By: noisy-shuttle\r\n\r\n";
@@ -161,7 +211,7 @@ async fn handle_connection_http(
     let mut buf = unsafe { vec_uninit(MAX_FIRST_PACKET_SIZE) };
     let mut end = 0;
     let mut initlen = 0; // initial data length
-    let (mut outbound, outbuf) = loop {
+    let (outbuf, connect_sent_direct, outbound) = loop {
         let n = inbound.read(&mut buf).await?;
         ensure!(n > 0, "incompleted http request");
         end += n;
@@ -211,17 +261,13 @@ async fn handle_connection_http(
                         .ok()
                         .context("invalid address")?;
                     inbound.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?;
-                    let snowys = connector
-                        .connect()
-                        .await
-                        .context("failed to establish snowy tunnel")?;
                     debug!(%dest_addr);
                     let header = TrojanLikeRequest::new(Cmd::Connect, dest_addr);
                     let mut outbuf = unsafe { vec_uninit(MAX_FIRST_PACKET_SIZE) };
                     let n = header.encode(&mut outbuf);
                     unsafe { outbuf.set_len(n) };
                     outbuf.extend_from_slice(&buf[start..end]);
-                    (snowys, Some(outbuf))
+                    (Some(outbuf), false, None)
                 }
                 method @ ("GET" | "POST" | "OPTIONS" | "HEAD" | "PUT" | "DELETE" | "TRACE"
                 | "PATCH") => {
@@ -245,10 +291,6 @@ async fn handle_connection_http(
                         .ok_or_else(|| anyhow!("invalid url: {}", url))?;
                     let path =
                         url_to_relative(url).ok_or_else(|| anyhow!("invalid url: {}", url))?;
-                    let mut snowys = connector
-                        .connect()
-                        .await
-                        .context("failed to establish snowy tunnel")?;
                     debug!(%dest_addr);
                     let header = TrojanLikeRequest::new(Cmd::Connect, dest_addr);
                     let mut outbuf = unsafe { vec_uninit(MAX_FIRST_PACKET_SIZE) };
@@ -274,8 +316,16 @@ async fn handle_connection_http(
                     unsafe { outbuf.set_len(n as usize) };
                     outbuf.extend_from_slice(&buf[start..end]);
                     trace!("sending request: {:?}", std::str::from_utf8(&outbuf));
-                    snowys.write_all(&outbuf).await?;
-                    (snowys, None)
+                    if pool.is_some() {
+                        (Some(outbuf), false, None)
+                    } else {
+                        let mut snowys = connector
+                            .connect()
+                            .await
+                            .context("failed to establish snowy tunnel")?;
+                        snowys.write_all(&outbuf).await?;
+                        (None, true, Some(snowys))
+                    }
                 }
                 method => {
                     inbound.write_all(HTTP_405_METHOD_NOT_ALLOWED).await?;
@@ -285,12 +335,201 @@ async fn handle_connection_http(
         }
     };
     let _t = Instant::now();
+    let relay = if let Some(mut outbound) = outbound {
+        relay_tcp_with(&mut inbound, &mut outbound, outbuf).await
+    } else {
+        relay_tcp_remote(
+            &mut inbound,
+            connector,
+            pool,
+            endpoint,
+            fallback_tracker,
+            outbuf,
+        )
+        .await
+    };
     log_relay!(async {
-        relay_tcp_with(&mut inbound, &mut outbound, outbuf)
-            .await
-            .map(|(tx, rx)| (tx + initlen, rx))
+        relay.map(|(tx, rx)| (tx + if connect_sent_direct { initlen } else { 0 }, rx))
     });
     Ok(())
+}
+
+async fn relay_tcp_remote(
+    inbound: &mut TcpStream,
+    connector: Arc<impl Connector + 'static>,
+    pool: Option<Arc<SessionPool>>,
+    endpoint: String,
+    fallback_tracker: Arc<FallbackTracker>,
+    outbuf: Option<Vec<u8>>,
+) -> Result<(u64, u64)> {
+    if let Some(pool) = pool {
+        match relay_tcp_reusable(inbound, &pool, outbuf.clone()).await {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                SessionEvent::FallbackToOneShot.emit();
+                fallback_tracker.warn_fallback(&endpoint);
+                warn!(error = %format!("{:#}", error), "reusable session failed before payload; retrying one-shot");
+            }
+        }
+    }
+
+    let mut outbound = connector
+        .connect()
+        .await
+        .context("failed to establish snowy tunnel")?;
+    relay_tcp_with(inbound, &mut outbound, outbuf).await
+}
+
+async fn relay_tcp_reusable(
+    inbound: &mut TcpStream,
+    pool: &SessionPool,
+    outbuf: Option<Vec<u8>>,
+) -> Result<(u64, u64)> {
+    let mut session = pool
+        .checkout()
+        .await
+        .context("failed to checkout reusable session")?;
+    let negotiated = if session.reuse_count == 0 {
+        match negotiate_client(&mut session.stream, Capabilities::new(CAP_REUSE)).await {
+            Ok(capabilities) if capabilities.reuse => true,
+            Ok(capabilities) => {
+                pool.return_session(session, false).await.ok();
+                return Err(anyhow!(
+                    "server negotiated without reuse capability: {:?}",
+                    capabilities
+                ));
+            }
+            Err(error) => {
+                pool.return_session(session, false).await.ok();
+                return Err(anyhow!("reusable session negotiation failed: {:?}", error));
+            }
+        }
+    } else {
+        false
+    };
+    debug!(
+        negotiated,
+        reuse_count = session.reuse_count,
+        "checked out reusable session"
+    );
+
+    let request = open_request_from_trojan_header(outbuf.as_deref())?;
+    if let Err(error) = write_frame(&mut session.stream, &request).await {
+        pool.return_session(session, false).await.ok();
+        return Err(anyhow!(error).context("failed to send reusable open request"));
+    }
+
+    let relay_result = relay_tcp_frames(inbound, &mut session, outbuf).await;
+    let healthy = relay_result.is_ok();
+    pool.return_session(session, healthy).await.ok();
+    relay_result
+}
+
+fn open_request_from_trojan_header(outbuf: Option<&[u8]>) -> Result<Frame> {
+    let outbuf = outbuf.context("reusable tcp relay requires an encoded trojan request")?;
+    let cmd = outbuf[0];
+    let atyp = outbuf[1];
+    let (addr_start, addr_end, port_start) = match atyp {
+        0x01 => (2, 6, 6),
+        0x04 => (2, 18, 18),
+        0x03 => {
+            let len = outbuf[2] as usize;
+            (3, 3 + len, 3 + len)
+        }
+        _ => {
+            return Err(anyhow!(
+                "unsupported address type in trojan request: {atyp}"
+            ))
+        }
+    };
+    ensure!(
+        outbuf.len() >= port_start + 2,
+        "truncated trojan request header"
+    );
+    let port = u16::from_be_bytes([outbuf[port_start], outbuf[port_start + 1]]);
+    Ok(Frame::OpenRequest {
+        cmd,
+        atyp,
+        addr: outbuf[addr_start..addr_end].to_vec(),
+        port,
+    })
+}
+
+async fn relay_tcp_frames(
+    inbound: &mut TcpStream,
+    session: &mut PooledSession,
+    outbuf: Option<Vec<u8>>,
+) -> Result<(u64, u64)> {
+    let mut tx = 0u64;
+    let mut rx = 0u64;
+    if let Some(mut outbuf) = outbuf {
+        let header_len = trojan_header_len(&outbuf)?;
+        let mut offset = outbuf.len();
+        if offset < MAX_FIRST_PACKET_SIZE {
+            outbuf.reserve_exact(MAX_FIRST_PACKET_SIZE - offset);
+            unsafe { outbuf.set_len(MAX_FIRST_PACKET_SIZE) };
+            if let Ok(Ok(n)) =
+                timeout(FIRST_PACKET_TIMEOUT, inbound.read(&mut outbuf[offset..])).await
+            {
+                offset += n;
+            }
+        }
+        if offset > header_len {
+            let data = outbuf[header_len..offset].to_vec();
+            tx += data.len() as u64;
+            write_frame(&mut session.stream, &Frame::Data(data)).await?;
+        }
+    }
+
+    let (mut inbound_r, mut inbound_w) = tokio::io::split(inbound);
+    let (mut session_r, mut session_w) = tokio::io::split(&mut session.stream);
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut client_closed = false;
+    loop {
+        tokio::select! {
+            read = inbound_r.read(&mut buf), if !client_closed => {
+                let n = read.context("failed to read inbound client data")?;
+                if n == 0 {
+                    client_closed = true;
+                    write_frame(&mut session_w, &Frame::EndRequest { reason: CloseReason::ClientClose as u8 }).await?;
+                } else {
+                    tx += n as u64;
+                    write_frame(&mut session_w, &Frame::Data(buf[..n].to_vec())).await?;
+                }
+            }
+            frame = read_frame(&mut session_r) => {
+                match frame? {
+                    Frame::Data(data) => {
+                        rx += data.len() as u64;
+                        inbound_w.write_all(&data).await.context("failed to write framed server data to inbound client")?;
+                    }
+                    Frame::EndRequest { .. } => break,
+                    Frame::Reset { reason } => return Err(anyhow!("reusable request reset by server: {reason}")),
+                    Frame::Close { reason } => return Err(anyhow!("reusable session closed by server: {reason}")),
+                    Frame::Ping { token } => write_frame(&mut session_w, &Frame::Pong { token }).await?,
+                    frame => return Err(anyhow!("unexpected reusable relay frame: {:?}", frame)),
+                }
+            }
+        }
+    }
+    Ok((tx, rx))
+}
+
+fn trojan_header_len(outbuf: &[u8]) -> Result<usize> {
+    ensure!(outbuf.len() >= 4, "truncated trojan header");
+    let addr_len = match outbuf[1] {
+        0x01 => 4,
+        0x04 => 16,
+        0x03 => outbuf[2] as usize + 1,
+        atyp => {
+            return Err(anyhow!(
+                "unsupported address type in trojan request: {atyp}"
+            ))
+        }
+    };
+    let len = 1 + 1 + addr_len + 2 + 2;
+    ensure!(outbuf.len() >= len, "truncated trojan header");
+    Ok(len)
 }
 
 // TODO: bullshit API design
