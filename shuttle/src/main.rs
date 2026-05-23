@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 mod client;
 mod opt;
 mod server;
+mod session;
 mod trojan;
 mod utils;
 

@@ -26,6 +26,16 @@ pub trait Connector {
     async fn connect(&self) -> io::Result<SnowyStream>;
 }
 
+#[async_trait]
+impl<T> Connector for Arc<T>
+where
+    T: Connector + Send + Sync,
+{
+    async fn connect(&self) -> io::Result<SnowyStream> {
+        T::connect(self.as_ref()).await
+    }
+}
+
 /// Connector that establish connections in advance based on some simple heuristic predications
 ///
 /// A preflighter starts with a queue at its lower bound capacity, which is then filled with

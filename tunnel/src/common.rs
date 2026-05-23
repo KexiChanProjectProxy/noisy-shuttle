@@ -80,6 +80,10 @@ impl SnowyStream {
     pub fn as_inner_mut(&mut self) -> &mut TcpStream {
         &mut self.socket
     }
+
+    pub fn buffered_plaintext(&self) -> &[u8] {
+        &self.read_buffer[self.read_offset..]
+    }
 }
 
 impl fmt::Debug for SnowyStream {

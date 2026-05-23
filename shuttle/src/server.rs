@@ -12,14 +12,28 @@ use std::sync::Arc;
 
 use snowy_tunnel::{Server, SnowyStream};
 
-use crate::opt::SvrOpt;
+use crate::opt::{ReuseConfig, SvrOpt};
 use crate::trojan::{
     call_with_addr, read_trojan_like_request, Addr, TrojanUdpDatagramReceiver,
     TrojanUdpDatagramSender, MAX_DATAGRAM_SIZE,
 };
 use crate::utils::vec_uninit;
 
+pub mod session_loop;
+
 const MAX_CACHED_DOMAIN_ADDRS_PER_SOCKET: usize = 64;
+
+pub(crate) fn default_server_reuse_config() -> ReuseConfig {
+    ReuseConfig {
+        max_idle: 4,
+        max_requests: 100,
+        max_age: std::time::Duration::from_secs(1800),
+        idle_timeout: std::time::Duration::from_secs(300),
+        keepalive_interval: std::time::Duration::from_secs(30),
+        keepalive_timeout: std::time::Duration::from_secs(10),
+        jitter_percent: 10,
+    }
+}
 
 pub async fn run_server(opt: SvrOpt) -> Result<()> {
     warn!(
@@ -60,9 +74,19 @@ pub async fn handle_connection<A: ToSocketAddrs + Debug>(
     match server.accept(inbound).await {
         Ok(mut snowys) => {
             use crate::trojan::Cmd::*;
-            let req = read_trojan_like_request(&mut snowys)
-                .await
-                .context("failed to read request header")?;
+            let req = match read_trojan_like_request(&mut snowys).await {
+                Ok(req) => req,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    let frame = crate::session::frame::read_frame(&mut snowys)
+                        .await
+                        .context("failed to read reusable session hello")?;
+                    session_loop::SessionLoop::new(default_server_reuse_config())
+                        .run_with_first_frame(snowys, frame)
+                        .await?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error).context("failed to read request header"),
+            };
             info!(command=?req.cmd, dest_addr=%req.dest_addr, "accepting request");
 
             match req.cmd {

@@ -198,8 +198,12 @@ pub async fn read_trojan_like_request(
     mut stream: impl AsyncRead + AsyncWrite + Unpin,
 ) -> io::Result<TrojanLikeRequest> {
     let t = stream.read_u8().await?;
-    let cmd = Cmd::from_u8(t)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "client request unspported command"))?;
+    let cmd = Cmd::from_u8(t).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "client request unspported command",
+        )
+    })?;
 
     let addr = Addr::read(&mut stream).await.map_err(|e| e.to_io_err())?;
     if stream.read_u16().await? != CRLF {

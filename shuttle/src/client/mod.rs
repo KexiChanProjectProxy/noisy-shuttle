@@ -2,16 +2,19 @@ use anyhow::Result;
 
 use tracing::{debug, info, warn};
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::opt::CltOpt;
 
 mod connector;
 mod plain;
+pub mod pool;
 // mod redir; // UNIMPLEMENTED
 
 use self::connector::{AdHocConnector, Preflighter, PREFLIHGTER_CONNIDLE, PREFLIHGTER_EMA_COEFF};
 use self::plain::serve as serve_plain;
+use self::pool::SessionPool;
 
 /// Maximum size of the initial data from inbound TCP socket which would be sent together with
 /// request header
@@ -41,12 +44,27 @@ pub async fn run_client(opt: CltOpt) -> Result<()> {
 
     match opt.preflight {
         (0, Some(0)) => {
-            let connector = AdHocConnector::new(client, opt.remote_addr);
-            serve_plain(opt.listen_addr, connector).await?;
+            let remote_addr = opt.remote_addr.clone();
+            let connector = Arc::new(AdHocConnector::new(client, remote_addr.clone()));
+            let pool = opt
+                .reuse_config()
+                .map_err(anyhow::Error::msg)?
+                .map(|config| Arc::new(SessionPool::new(config, Box::new(connector.clone()))));
+            serve_plain(opt.listen_addr, connector, pool, remote_addr).await?;
         }
         (min, max) => {
-            let preflighter = Preflighter::new_flighting(client, opt.remote_addr, min, max);
-            serve_plain(opt.listen_addr, preflighter).await?;
+            let remote_addr = opt.remote_addr.clone();
+            let preflighter = Arc::new(Preflighter::new_flighting(
+                client,
+                remote_addr.clone(),
+                min,
+                max,
+            ));
+            let pool = opt
+                .reuse_config()
+                .map_err(anyhow::Error::msg)?
+                .map(|config| Arc::new(SessionPool::new(config, Box::new(preflighter.clone()))));
+            serve_plain(opt.listen_addr, preflighter, pool, remote_addr).await?;
         }
     };
     Ok(())
