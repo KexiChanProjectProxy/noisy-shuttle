@@ -28,6 +28,12 @@ noisy-shuttle is essentially shadow-tls + trojan + shadowsocks. -->
 - Customizable TLS client fingerprints specified via Cli option
   - Replicate any fingerprints listed in https://tlsfingerprint.io exactly
 
+- Opt-in connection reuse with protocol-level keep-alive
+  - Reuse established tunnels for sequential requests instead of creating a new tunnel per request
+  - Idle session Ping/Pong keep-alive with configurable timeout
+  - Graceful fallback to one-shot mode when the server does not support reuse
+  - All reuse features default OFF — existing behavior unchanged
+
 ## Handshaking procedures
 - shuttle client contrives a legit TLS ClientHello and sends it to shuttle server. Unlike in a typical TLS handshake, the client random and session id field of the ClientHello totaling 64 bytes, which should have been randomly generated, are filled with an ephemeral X25519 public key and an AEAD tag as a part of the Noise [NNPsk0 handshake](https://noiseexplorer.com/patterns/NNpsk0/). And then it proceeds to perform real TLS handshakes with the special ClientHello as typical.
 - When shuttle server received a ClientHello, it tries to pull the public key and the AEAD tag from the ClientHello and authenticate them with Noise against a pre-shared key. shuttle server then forwards the ClientHello to a camouflage website and relays subsequent TLS handshake messages between shuttle client and the camouflage server until TLS handshaking is done.
@@ -62,6 +68,22 @@ The client would serve a SOCKS5/HTTP (adaptive) proxy at `listen_addr`.
 ./noisy-shuttle client 127.0.0.1:1080 server.addr.example:443 www.example.com Teap0taa --tls-ja3 769,2570-4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,2570-0-23-65281-10-11-35-16-5-13-18-51-45-43-27-17513-2570-21,2570-29-23-24,0 --tls-alpn h2,http/1.1 --tls-sigalgos 1027,2052,1025,1283,2053,1281,2054,1537 --tls-versions 2570,772,771 --tls-keyshare 2570
 ```
 
+**With connection reuse (opt-in):**
+```sh
+./noisy-shuttle client 127.0.0.1:1080 server.addr.example:443 www.example.com Teap0taa --reuse --reuse-max-idle 4
+```
+
+When `--reuse` is enabled, the client negotiates a reusable session protocol with the server.
+If the server does not support reuse, the client logs a warning and falls back to one-shot tunnels.
+
+**Available reuse options:**
+- `--reuse` — Enable reusable session pooling (default: disabled)
+- `--keepalive-interval <seconds>` — Keep-alive interval for idle sessions (default: 30)
+- `--reuse-max-idle <count>` — Max idle reusable sessions per endpoint (default: 4)
+- `--reuse-max-age <seconds>` — Max session age before eviction (default: 1800)
+- `--reuse-max-requests <count>` — Max requests per session before close (default: 100)
+- `--reuse-idle-timeout <seconds>` — Max idle time before eviction (default: 300)
+
 <!--
 Example fingerprints:
 
@@ -74,6 +96,22 @@ https://tlsfingerprint.io/id/e47eae8f8c4887b6: `--tls-ja3 769,2570-4865-4866-486
 
 ## TODO
 - [ ] connection multiplex or connection reuse?
+
+## Session Protocol
+
+When `--reuse` is enabled, the client and server negotiate capabilities via a `ClientHello` frame after the Noise tunnel is established. The versioned session protocol supports the following frame types:
+
+| Frame | Description |
+|-------|-------------|
+| `ClientHello` | Protocol version and capability negotiation |
+| `OpenRequest` | Request to open a proxy connection (SOCKS5/HTTP) |
+| `Data` | Payload data relay |
+| `EndRequest` | End of a request stream |
+| `Reset` | Abort current request on error |
+| `Ping/Pong` | Keep-alive health check with token correlation |
+| `Close` | Close the session with a reason code |
+
+Sessions enforce configurable limits (max requests, max age, idle timeout) and support graceful shutdown with in-flight request drain.
 - [ ] Embed `e, ee` into server-side CCS in TLS 1.2
 - [x] Handle TLS1.3 response from camouflage server properly
 - [ ] Elligator for public key
